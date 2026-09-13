@@ -491,7 +491,94 @@ def get_cm(kmin, kmax, N, b_nu, inputpkT):
 
 
 # In[6]:
+# ============================================================================================ #
+#                                    GEO-FPT helpers                                            #
+# ============================================================================================ #
 
+import jax.numpy as jnp
+f1 = jnp.array([1.00334041e+00, -3.97587153e-03, 2.39676798e-02, -5.68098245e-02, 1.32544359e-02])
+f2 = jnp.array([1.01798746e+00, -4.10578402e-03, 1.48808466e-02, -5.46660187e-02, 1.11441504e-02])
+f3 = jnp.array([1.03745852e+00, 1.95019784e-03, 5.56349564e-03, -4.83637541e-02, 8.06689225e-03])
+F_VALS_FULL = jnp.stack([f3, f2, f1], axis = -1)
+    
+f1 = jnp.array([1.00321199, 0.00778061, 0.04035794, -0.07043621, 0.01390807])
+f2 = jnp.array([1.15615701, 0.01335707, -0.00582238, -0.08951067, 0.01584383])
+f3 = jnp.array([1.29787528, 0.01154473, -0.06984416, -0.09486691, 0.01642198])
+F_VALS = jnp.stack([f3, f2, f1], axis = -1)
+
+def interpolate_geo_coeffs(redshift, fi_vals=None,
+                           a_vals=(1.0/3.0, 1.0/2.0, 2.0/3.0)):
+    """Linearly interpolate the 5 GEO-FPT coefficients to the given redshift.
+
+    JAX-compatible: works under jit if `redshift` is a tracer.  `fi_vals`
+    and `a_vals` are treated as static constants.
+    """
+    if fi_vals is None:
+        fi_vals = F_VALS_FULL
+    a_vals = np.asarray(a_vals)
+    fi_vals = np.asarray(fi_vals)
+    a_t = 1.0 / (1.0 + redshift)
+    n = fi_vals.shape[0]
+    # Static-unrolled linear interpolation per row.  np.interp resolves to
+    # jnp.interp under the JAX backend, which is jit-compatible.
+    return np.stack([np.interp(a_t, a_vals, fi_vals[i]) for i in range(n)])
+
+
+def geo_fac(ka, kb, kc, af, hh=1.0):
+    """GEO-FPT geometric factor (polynomial form).  Symmetric in (ka, kb, kc)."""
+    ka, kb, kc = np.broadcast_arrays(ka, kb, kc)
+    k = np.stack([ka, kb, kc], axis=0)
+    kmax = np.max(k, axis=0); kmin = np.min(k, axis=0)
+    kmed = ka + kb + kc - kmax - kmin
+
+    cosmax = (kmed**2 + kmin**2 - kmax**2) / (2.0 * kmed * kmin)
+    cosmed = (kmax**2 + kmin**2 - kmed**2) / (2.0 * kmax * kmin)
+    cosmin = (kmax**2 + kmed**2 - kmin**2) / (2.0 * kmax * kmed)
+
+    perim = (ka + kb + kc) / 2.0
+    area_sq = perim * (perim - ka) * (perim - kb) * (perim - kc)
+    area = np.sqrt(np.maximum(area_sq, 1e-30)) / (hh**2 * 0.001)
+
+    return (af[0]
+            + af[1] * cosmed / cosmin
+            + af[2] * cosmax / cosmin
+            + af[3] * area
+            + af[4] * area**2)
+
+
+def geo_fac_pade(ka, kb, kc, af, hh=1.0):
+    """GEO-FPT geometric factor with a Padé [2/2] area term.
+
+    Matches the polynomial form at small area A and saturates to 1 at large A,
+    so the shape correction switches off beyond the BAO scale.
+    """
+    ka, kb, kc = np.broadcast_arrays(ka, kb, kc)
+    f1, f2, f3, f4, f5 = af
+
+    perim = (ka + kb + kc) / 2.0
+    area_sq = perim * (perim - ka) * (perim - kb) * (perim - kc)
+    area = np.sqrt(np.maximum(area_sq, 1e-30)) / (hh**2 * 0.001)
+
+    k = np.stack([ka, kb, kc], axis=0)
+    kmax = np.max(k, axis=0); kmin = np.min(k, axis=0)
+    kmed = ka + kb + kc - kmax - kmin
+
+    cosmax = (kmed**2 + kmin**2 - kmax**2) / (2.0 * kmed * kmin)
+    cosmed = (kmax**2 + kmin**2 - kmed**2) / (2.0 * kmax * kmin)
+    cosmin = (kmax**2 + kmed**2 - kmin**2) / (2.0 * kmax * kmed)
+
+    shape = (f1
+             + f2 * np.where(np.abs(cosmin) > 1e-10, cosmed / cosmin, 0.0)
+             + f3 * np.where(np.abs(cosmin) > 1e-10, cosmax / cosmin, 0.0))
+
+    A_target = np.maximum(1.0 - shape, 1e-6)
+    p1 = f4
+    q1 = 2.0 * f4
+    p2 = f5 + f4 * q1
+    q2 = p2 / A_target
+
+    area_terms = (p1 * area + p2 * area**2) / (1.0 + q1 * area + q2 * area**2)
+    return shape + area_terms
 
 class MatrixCalculator:
     """
@@ -1339,6 +1426,21 @@ class NonLinearPowerSpectrumCalculator:
         fk = self.f0 * self.Fkoverf0
 
         return {"k": self.kTout,"pk_l": pk_l,"pk_l_NW": pk_l_NW,"f_k": fk,"f0": self.f0}
+
+    def get_geofpt_pk_tables(self, k, pklin, pknow=None, cosmo=None, **kwargs):
+        """Return `(k, P_nl, P_nl_NW)` to be passed as `k_pkl_pklnw_nl` to
+        `BispectrumCalculator_Geo`.
+
+        P_nl = P_lin + P_loop_dd from the FOLPS 1-loop calculation.  The
+        wiggle/no-wiggle split is applied later, inside the geo calculator,
+        to the nonlinear P, matching the GEO-FPT prescription.
+        """
+        table, table_NW = self.calculate_loop_table(
+            k=k, pklin=pklin, pknow=pknow, cosmo=cosmo, **kwargs)
+        k_out    = table[0]
+        pk_nl    = table[1] + table[3]       # P_lin + P_loop_dd
+        pk_nl_nw = table_NW[1] + table_NW[3]
+        return np.array([k_out, pk_nl, pk_nl_nw])
 
 
 def fog_damping(*kmu_X, f=1., sigma2v=1., damping='lor'):
@@ -2229,6 +2331,7 @@ class BispectrumCalculator:
         #     raise ValueError("basis must be 'sugiyama' or 'scoccimarro'.")
         self.model = model
         self._printed_model_damping_bk = True
+        self._tables_cache = {}
 
     def set_bias_scheme(self, pars, bias_scheme="folps"):
         """Sets the nuisance parameters based on the selected bias scheme."""
@@ -3124,6 +3227,7 @@ class BispectrumCalculator_fk:
         #     raise ValueError("basis must be 'sugiyama' or 'scoccimarro'.")
         self.model = model
         self._printed_model_damping_bk = True
+        self._tables_cache = {}
 
 
     def set_bias_scheme(self, pars, bias_scheme="folps"):
@@ -4041,7 +4145,801 @@ class BispectrumCalculator_fk:
         return B0, B2, B4, x
 
 
+# ============================================================================================ #
+#                              GEO-FPT bispectrum calculators                                   #
+# ============================================================================================ #
+# These classes are self-contained: every evaluation method is fully defined here, with its    #
+# own signature that accepts `k_pkl_pklnw_nl` / `k_pkl_pklnw_fk_nl` and `z`.  The parent       #
+# calculator is used only for its pure-math helpers (Z2, APtransforms, sigmas,                 #
+# interpolation_b, angdep_integrands, _compute_single_integrand, tablesGL_f/2, set_bias_scheme,#
+# _gauss_legendre).  The parent's evaluation methods are not called and their signatures       #
+# are not needed here.                                                                          #
+#                                                                                               #
+# State precedence for `k_pkl_pklnw_nl` and `z`:                                                #
+#   per-call keyword  >  instance state (set at construction or via `set_pk_nl`)                #
+# ============================================================================================ #
 
+
+class BispectrumCalculator_Geo(BispectrumCalculator):
+    """GEO-FPT variant of `BispectrumCalculator`.
+
+    Adds a redshift- and triangle-shape-dependent geometric factor to the
+    tree-level Z2 kernel and uses a caller-supplied nonlinear power spectrum
+    for the tree-level products.  Fully self-contained: every public method
+    has its own signature with the two optional keywords `k_pkl_pklnw_nl`
+    and `z`.
+
+    Parameters
+    ----------
+    model : str
+        Model name ('EFT', 'TNS', 'FOLPSD').
+    geo_expansion : {'poly', 'pade'}, optional
+        Polynomial or Padé form of the geometric factor.  Default 'poly'.
+    fi_vals : ndarray of shape (5, 3), optional
+        GEO-FPT coefficient table.  Defaults to `F_VALS_FULL`.
+    k_pkl_pklnw_nl : tuple, optional
+        (k, P_nl, P_nl_no_wiggle).  Can also be passed per call or via
+        `set_pk_nl`.
+    z : float, optional
+        Redshift for the coefficient interpolation.  Can also be passed per
+        call or via `set_pk_nl`.
+    """
+
+    def __init__(self, model='FOLPSD',
+                 geo_expansion='poly', fi_vals=None,
+                 k_pkl_pklnw_nl=None, z=None):
+        super().__init__(model=model)
+        self.geo_expansion = geo_expansion
+        self.fi_vals = np.asarray(fi_vals) if fi_vals is not None else F_VALS_FULL
+        self.k_pkl_pklnw_nl = k_pkl_pklnw_nl
+        self.z = z
+        self._tables_cache = {}
+
+    # ----------------------------------------------------------------------
+    #  State helpers
+    # ----------------------------------------------------------------------
+    def set_pk_nl(self, k_pkl_pklnw_nl=None, z=None):
+        """Update the nonlinear P(k) table and/or redshift.  Returns self."""
+        if k_pkl_pklnw_nl is not None:
+            self.k_pkl_pklnw_nl = k_pkl_pklnw_nl
+        if z is not None:
+            self.z = z
+        return self
+
+    def _resolve_nl_state(self, k_pkl_pklnw_nl, z):
+        if k_pkl_pklnw_nl is None:
+            k_pkl_pklnw_nl = self.k_pkl_pklnw_nl
+        if z is None:
+            z = self.z
+        if k_pkl_pklnw_nl is None:
+            raise ValueError(
+                "BispectrumCalculator_Geo requires a nonlinear power spectrum. "
+                "Pass `k_pkl_pklnw_nl=(k, P_nl, P_nl_NW)` at construction, via "
+                "`set_pk_nl`, or as a keyword argument to the method being called.")
+        if z is None:
+            raise ValueError(
+                "BispectrumCalculator_Geo requires a redshift `z`. "
+                "Pass it at construction, via `set_pk_nl`, or as a keyword argument.")
+        return k_pkl_pklnw_nl, z
+
+    def _geo_factor(self, k1AP, k2AP, k3AP, z):
+        af = interpolate_geo_coeffs(z, self.fi_vals)
+        geo = geo_fac_pade if self.geo_expansion == 'pade' else geo_fac
+        return geo(k1AP, k2AP, k3AP, af, hh=1.0)
+
+    # ----------------------------------------------------------------------
+    #  bispectrum
+    # ----------------------------------------------------------------------
+    def bispectrum(self, k1, k2, x12, mu1, phi, f, sigma2v, Sigma2, deltaSigma2,
+                   bpars, qpar, qperp, k_pkl_pklnw, damping='lor',
+                   interpolation_method='cubic',
+                   k_pkl_pklnw_nl=None, z=None):
+        """Tree-level redshift-space bispectrum with GEO-FPT modifications."""
+        k_pkl_pklnw_nl, z = self._resolve_nl_state(k_pkl_pklnw_nl, z)
+
+        b1, b2, bs, c1, c2, Bshot, Pshot, X_FoG_b = bpars
+
+        cosphi = np.cos(phi)
+        APtransf = self.APtransforms(k1, k2, x12, mu1, cosphi, qpar, qperp)
+        (k1AP, k2AP, k3AP, x12AP, x23AP, x31AP,
+         mu1AP, mu2AP, mu3AP, cosphi) = APtransf
+
+        eff_fact = self._geo_factor(k1AP, k2AP, k3AP, z)
+
+        k_     = k_pkl_pklnw_nl[0]
+        pkl_   = k_pkl_pklnw_nl[1]
+        pklnw_ = k_pkl_pklnw_nl[2]
+
+        pk1   = self.interpolation_b(k1AP, k_, pkl_,   method=interpolation_method)
+        pk1nw = self.interpolation_b(k1AP, k_, pklnw_, method=interpolation_method)
+        pk2   = self.interpolation_b(k2AP, k_, pkl_,   method=interpolation_method)
+        pk2nw = self.interpolation_b(k2AP, k_, pklnw_, method=interpolation_method)
+        pk3   = self.interpolation_b(k3AP, k_, pkl_,   method=interpolation_method)
+        pk3nw = self.interpolation_b(k3AP, k_, pklnw_, method=interpolation_method)
+
+        e1IR = (1 + f*mu1AP**2*(2 + f))*Sigma2 + (f*mu1AP)**2*(mu1AP**2 - 1)*deltaSigma2
+        e2IR = (1 + f*mu2AP**2*(2 + f))*Sigma2 + (f*mu2AP)**2*(mu2AP**2 - 1)*deltaSigma2
+        e3IR = (1 + f*mu3AP**2*(2 + f))*Sigma2 + (f*mu3AP)**2*(mu3AP**2 - 1)*deltaSigma2
+
+        pkIR1 = pk1nw + (pk1-pk1nw)*np.exp(-e1IR*k1AP**2)
+        pkIR2 = pk2nw + (pk2-pk2nw)*np.exp(-e2IR*k2AP**2)
+        pkIR3 = pk3nw + (pk3-pk3nw)*np.exp(-e3IR*k3AP**2)
+
+        f1 = f2 = f3 = f
+        Z1_1 = b1 + f1 * mu1AP**2
+        Z1_2 = b1 + f2 * mu2AP**2
+        Z1_3 = b1 + f3 * mu3AP**2
+
+        Z1eft1 = Z1_1 - (c1 * mu1AP**2 + c2 * mu1AP**4) * k1AP**2
+        Z1eft2 = Z1_2 - (c1 * mu2AP**2 + c2 * mu2AP**4) * k2AP**2
+        Z1eft3 = Z1_3 - (c1 * mu3AP**2 + c2 * mu3AP**4) * k3AP**2
+
+        B12 = (2 * eff_fact * self.Z2(k1AP, k2AP, x12AP, mu1AP, mu2AP, f, b1, b2, bs)
+               * Z1eft1 * pkIR1 * Z1eft2 * pkIR2)
+        B23 = (2 * eff_fact * self.Z2(k2AP, k3AP, x23AP, mu2AP, mu3AP, f, b1, b2, bs)
+               * Z1eft2 * pkIR2 * Z1eft3 * pkIR3)
+        B31 = (2 * eff_fact * self.Z2(k3AP, k1AP, x31AP, mu3AP, mu1AP, f, b1, b2, bs)
+               * Z1eft3 * pkIR3 * Z1eft1 * pkIR1)
+
+        W = fog_damping((k1AP * mu1AP, X_FoG_b),
+                        (k2AP * mu2AP, X_FoG_b),
+                        (k3AP * mu3AP, X_FoG_b),
+                        f=f, sigma2v=sigma2v, damping=damping)
+
+        shot = ((b1*Bshot + 2.0*Pshot*f1*mu1AP**2) * Z1eft1 * pkIR1
+                + (b1*Bshot + 2.0*Pshot*f2*mu2AP**2) * Z1eft2 * pkIR2
+                + (b1*Bshot + 2.0*Pshot*f3*mu3AP**2) * Z1eft3 * pkIR3
+                + Pshot**2)
+
+        bispectrum = W*(B12 + B23 + B31) + shot
+        alpha = qpar * qperp**2
+        return bispectrum / alpha**2
+
+    # ----------------------------------------------------------------------
+    #  Sugiyama
+    # ----------------------------------------------------------------------
+    def Sugiyama_Bl1l2L(self, k1, k2, f, sigma2v, Sigma2, deltaSigma2, bpars,
+                        qpar, qper, tablesGL, k_pkl_pklnw, damping='lor',
+                        renormalize=True, multipoles=['B000', 'B202'],
+                        interpolation_method='linear', precision=None,
+                        k_pkl_pklnw_nl=None, z=None):
+        k_pkl_pklnw_nl, z = self._resolve_nl_state(k_pkl_pklnw_nl, z)
+
+        phiGL, xGL, muGL = tablesGL
+        phi, wphi = phiGL[:, 0], phiGL[:, 1]
+        x, wx     = xGL[:, 0],  xGL[:, 1]
+        mu, wmu   = muGL[:, 0], muGL[:, 1]
+
+        x_mesh   = x[None, :, None, None]
+        mu_mesh  = mu[None, None, :, None]
+        phi_mesh = phi[None, None, None, :]
+        cosphi   = np.cos(phi_mesh)
+        cos2phi  = np.cos(2 * phi_mesh)
+
+        bisp = self.bispectrum(
+            k1, k2, x_mesh, mu_mesh, phi_mesh,
+            f, sigma2v, Sigma2, deltaSigma2,
+            bpars, qpar, qper, k_pkl_pklnw,
+            damping=damping, interpolation_method=interpolation_method,
+            k_pkl_pklnw_nl=k_pkl_pklnw_nl, z=z)
+
+        Hl1l2L_dict = {
+            'B000': 1.0, 'B110': -1 / np.sqrt(3), 'B220': 1 / np.sqrt(5),
+            'B202': 1 / np.sqrt(5), 'B022': 1 / np.sqrt(5),
+            'B112': np.sqrt(2 / 15), 'B222': -2 / np.sqrt(70),
+        }
+
+        result = {}
+        for mp in multipoles:
+            integrand = self._compute_single_integrand(mp, x_mesh, mu_mesh,
+                                                        phi_mesh, cosphi, cos2phi)
+            int_phi = 2 * np.sum(bisp * integrand * wphi[None, None, None, :], axis=3)
+            int_mu  = np.sum(int_phi * wmu[None, None, :], axis=2)
+            int_x   = np.sum(int_mu * wx[None, :], axis=1)
+            if renormalize:
+                int_x *= Hl1l2L_dict[mp]
+            if np.ndim(k1) == 0 and np.ndim(k2) == 0:
+                result[mp] = float(int_x)
+            else:
+                result[mp] = int_x
+        return result
+
+    def Sugiyama_Bell(self, f, bpars, k_pkl_pklnw, k1k2pairs, qpar, qper,
+                      precision=[8, 10, 10], damping='lor',
+                      m_bin=None, k_thy=None, do_binning=False,
+                      multipoles=['B000', 'B202'], renormalize=True,
+                      interpolation_method='linear', bias_scheme='folps',
+                      do_interp_bk=False, kout=None,
+                      k_pkl_pklnw_nl=None, z=None):
+        all_multipoles = ['B000', 'B110', 'B220', 'B202', 'B022', 'B112', 'B222']
+        for mp in multipoles:
+            if mp not in all_multipoles:
+                raise ValueError(f"Invalid multipole '{mp}'. Available: {all_multipoles}")
+
+        k_pkl_pklnw_nl, z = self._resolve_nl_state(k_pkl_pklnw_nl, z)
+
+        bpars = self.set_bias_scheme(bpars, bias_scheme=bias_scheme)
+
+        k1k2pairs = np.asarray(k1k2pairs)
+        k1 = k1k2pairs[:, 0][:, None, None, None]
+        k2 = k1k2pairs[:, 1][:, None, None, None]
+
+        tablesGL = self.tablesGL_f(precision)
+        sigma2v, Sigma2, deltaSigma2 = self.sigmas(k_pkl_pklnw[0], k_pkl_pklnw[1])
+
+        phiGL, xGL, muGL = tablesGL
+        phi, wphi = phiGL[:, 0], phiGL[:, 1]
+        x, wx     = xGL[:, 0],  xGL[:, 1]
+        mu, wmu   = muGL[:, 0], muGL[:, 1]
+
+        x_mesh   = x[None, :, None, None]
+        mu_mesh  = mu[None, None, :, None]
+        phi_mesh = phi[None, None, None, :]
+        cosphi   = np.cos(phi_mesh)
+        cos2phi  = np.cos(2 * phi_mesh)
+
+        bisp = self.bispectrum(
+            k1, k2, x_mesh, mu_mesh, phi_mesh,
+            f, sigma2v, Sigma2, deltaSigma2,
+            bpars, qpar, qper, k_pkl_pklnw,
+            damping=damping, interpolation_method=interpolation_method,
+            k_pkl_pklnw_nl=k_pkl_pklnw_nl, z=z)
+
+        Hl1l2L_dict = {
+            'B000': 1.0, 'B110': -1 / np.sqrt(3), 'B220': 1 / np.sqrt(5),
+            'B202': 1 / np.sqrt(5), 'B022': 1 / np.sqrt(5),
+            'B112': np.sqrt(2 / 15), 'B222': -2 / np.sqrt(70),
+        }
+
+        multipoles_dict = {}
+        for mp in multipoles:
+            integrand = self._compute_single_integrand(mp, x_mesh, mu_mesh,
+                                                        phi_mesh, cosphi, cos2phi)
+            int_phi = 2 * np.sum(bisp * integrand * wphi[None, None, None, :], axis=3)
+            int_mu  = np.sum(int_phi * wmu[None, None, :], axis=2)
+            int_x   = np.sum(int_mu * wx[None, :], axis=1)
+            if renormalize:
+                int_x *= Hl1l2L_dict[mp]
+            multipoles_dict[mp] = int_x
+
+        if do_binning:
+            if m_bin is None or k_thy is None:
+                raise ValueError("do_binning=True requires m_bin and k_thy.")
+            m_bin_arr = np.asarray(m_bin); k_thy_arr = np.asarray(k_thy)
+            x = np.asarray(k1k2pairs)[:, 0]
+            binned_results = []
+            for mp in multipoles:
+                mp_interp = interp(k_thy_arr, x, multipoles_dict[mp])
+                binned_results.append(m_bin_arr @ mp_interp)
+            return tuple(binned_results)
+
+        if do_interp_bk:
+            if kout is None:
+                raise ValueError("do_interp=True requires kout.")
+            k_thy_arr = np.asarray(kout)
+            x = np.asarray(k1k2pairs)[:, 0]
+            interp_results = []
+            for mp in multipoles:
+                interp_results.append(interp(k_thy_arr, x, multipoles_dict[mp]))
+            return tuple(interp_results)
+
+        return tuple(multipoles_dict[mp] for mp in multipoles)
+
+    # ----------------------------------------------------------------------
+    #  Scoccimarro
+    # ----------------------------------------------------------------------
+    def Scoccimarro_B024(self, k1k2k3triplets, f, sigma2v, Sigma2, deltaSigma2,
+                         bpars, qpar, qperp, tablesGL, k_pkl_pklnw,
+                         damping='lor', interpolation_method='linear',
+                         multipoles=['B0', 'B2', 'B4'],
+                         k_pkl_pklnw_nl=None, z=None):
+        k_pkl_pklnw_nl, z = self._resolve_nl_state(k_pkl_pklnw_nl, z)
+
+        twopi = 2.0 * np.pi
+        normB0, normB2, normB4 = 0.5, 2.5, 4.5
+
+        k1k2k3triplets = np.asarray(k1k2k3triplets)
+        k1 = k1k2k3triplets[:, 0][:, None, None]
+        k2 = k1k2k3triplets[:, 1][:, None, None]
+        k3 = k1k2k3triplets[:, 2][:, None, None]
+        x = (k3**2 - k1**2 - k2**2) / (2.0 * k1 * k2)
+
+        phiGL, muGL = tablesGL
+        phi, wphi = phiGL[:, 0], phiGL[:, 1]
+        mu,  wmu  = muGL[:, 0],  muGL[:, 1]
+
+        mu_mesh  = mu[None, :, None]
+        phi_mesh = phi[None, None, :]
+
+        bisp = self.bispectrum(
+            k1, k2, x, mu_mesh, phi_mesh,
+            f, sigma2v, Sigma2, deltaSigma2,
+            bpars, qpar, qperp, k_pkl_pklnw,
+            damping=damping, interpolation_method=interpolation_method,
+            k_pkl_pklnw_nl=k_pkl_pklnw_nl, z=z)
+
+        int_phi = 2.0 * np.sum(bisp * wphi[None, None, :], axis=2)
+
+        results = {}
+        if 'B0' in multipoles:
+            results['B0'] = (np.sum(int_phi * wmu[None, :], axis=1) / twopi) * normB0
+        else:
+            results['B0'] = None
+
+        if 'B2' in multipoles:
+            leg2 = 0.5 * (-1.0 + 3.0 * mu**2)
+            results['B2'] = (np.sum(int_phi * leg2[None, :] * wmu[None, :], axis=1)
+                             / twopi) * normB2
+        else:
+            results['B2'] = None
+
+        if 'B4' in multipoles:
+            leg4 = (35.0 * mu**4 - 30.0 * mu**2 + 3.0) / 8.0
+            results['B4'] = (np.sum(int_phi * leg4[None, :] * wmu[None, :], axis=1)
+                             / twopi) * normB4
+        else:
+            results['B4'] = None
+
+        return results['B0'], results['B2'], results['B4'], x[:, 0, 0]
+
+    def Scoccimarro_Bell(self, k1k2k3triplets, f, bpars, qpar, qperp,
+                         k_pkl_pklnw, precision=[10, 10], damping='lor',
+                         interpolation_method='linear', m_bin=None, k_thy=None,
+                         do_binning=False, multipoles=['B0', 'B2', 'B4'],
+                         bias_scheme='folps',
+                         k_pkl_pklnw_nl=None, z=None):
+        k_pkl_pklnw_nl, z = self._resolve_nl_state(k_pkl_pklnw_nl, z)
+
+        bpars = self.set_bias_scheme(bpars, bias_scheme=bias_scheme)
+
+        kT, pklT = k_pkl_pklnw[0], k_pkl_pklnw[1]
+        sigma2v, Sigma2, deltaSigma2 = self.sigmas(kT, pklT)
+
+        tablesGL = self.tablesGL2_f(precision)
+
+        if backend == 'jax':
+            try:
+                import jax
+
+                def _single(k1, k2, k3):
+                    triplet = np.array([[k1, k2, k3]])
+                    return self.Scoccimarro_B024(
+                        triplet, f, sigma2v, Sigma2, deltaSigma2, bpars,
+                        qpar, qperp, tablesGL, k_pkl_pklnw, damping=damping,
+                        interpolation_method=interpolation_method,
+                        multipoles=multipoles,
+                        k_pkl_pklnw_nl=k_pkl_pklnw_nl, z=z)
+
+                vm = jax.vmap(_single)
+                triplets_arr = np.asarray(k1k2k3triplets)
+                stacked = vm(triplets_arr[:, 0], triplets_arr[:, 1], triplets_arr[:, 2])
+                B0 = stacked[0][:, 0]; B2 = stacked[1][:, 0]
+                B4 = stacked[2][:, 0]; x  = stacked[3][:, 0]
+
+                if do_binning:
+                    if m_bin is None or k_thy is None:
+                        raise ValueError("do_binning=True requires m_bin and k_thy.")
+                    m_bin_arr = np.asarray(m_bin); k_thy_arr = np.asarray(k_thy)
+                    k_vals = triplets_arr[:, 0]
+                    return (m_bin_arr @ interp(k_thy_arr, k_vals, B0),
+                            m_bin_arr @ interp(k_thy_arr, k_vals, B2),
+                            m_bin_arr @ interp(k_thy_arr, k_vals, B4))
+                return B0, B2, B4, x
+            except Exception:
+                pass
+
+        B0, B2, B4, x = self.Scoccimarro_B024(
+            k1k2k3triplets, f, sigma2v, Sigma2, deltaSigma2, bpars,
+            qpar, qperp, tablesGL, k_pkl_pklnw, damping, interpolation_method,
+            multipoles=multipoles,
+            k_pkl_pklnw_nl=k_pkl_pklnw_nl, z=z)
+
+        if do_binning:
+            if m_bin is None or k_thy is None:
+                raise ValueError("do_binning=True requires m_bin and k_thy.")
+            m_bin_arr = np.asarray(m_bin); k_thy_arr = np.asarray(k_thy)
+            triplets_arr = np.asarray(k1k2k3triplets)
+            k_vals = triplets_arr[:, 0]
+            return (m_bin_arr @ interp(k_thy_arr, k_vals, B0),
+                    m_bin_arr @ interp(k_thy_arr, k_vals, B2),
+                    m_bin_arr @ interp(k_thy_arr, k_vals, B4))
+
+        return B0, B2, B4, x
+    
+
+class BispectrumCalculator_fk_Geo(BispectrumCalculator_fk):
+    """GEO-FPT variant of `BispectrumCalculator_fk`.
+
+    Same design as `BispectrumCalculator_Geo`, but for the f(k)-dependent Z2
+    kernel.  The nonlinear power spectrum must be passed as
+    `k_pkl_pklnw_fk_nl = (k, P_nl, P_nl_nw, f(k))`, optionally with `[calA,
+    calAp]` appended.
+
+    Parameters
+    ----------
+    model : str
+    geo_expansion : {'poly', 'pade'}
+    fi_vals : ndarray, shape (5, 3), optional
+    k_pkl_pklnw_fk_nl : tuple, optional
+    z : float, optional
+    """
+
+    def __init__(self, model='FOLPSD',
+                 geo_expansion='poly', fi_vals=None,
+                 k_pkl_pklnw_fk_nl=None, z=None):
+        super().__init__(model=model)
+        self.geo_expansion = geo_expansion
+        self.fi_vals = np.asarray(fi_vals) if fi_vals is not None else F_VALS_FULL
+        self.k_pkl_pklnw_fk_nl = k_pkl_pklnw_fk_nl
+        self.z = z
+        self._tables_cache = {}
+
+    # ----------------------------------------------------------------------
+    #  State helpers
+    # ----------------------------------------------------------------------
+    def set_pk_nl(self, k_pkl_pklnw_fk_nl=None, z=None):
+        """Update the nonlinear P(k) table and/or redshift.  Returns self."""
+        if k_pkl_pklnw_fk_nl is not None:
+            self.k_pkl_pklnw_fk_nl = k_pkl_pklnw_fk_nl
+        if z is not None:
+            self.z = z
+        return self
+
+    def _resolve_nl_state(self, k_pkl_pklnw_fk_nl, z):
+        if k_pkl_pklnw_fk_nl is None:
+            k_pkl_pklnw_fk_nl = self.k_pkl_pklnw_fk_nl
+        if z is None:
+            z = self.z
+        if k_pkl_pklnw_fk_nl is None:
+            raise ValueError(
+                "BispectrumCalculator_fk_Geo requires a nonlinear power spectrum. "
+                "Pass `k_pkl_pklnw_fk_nl=(k, P_nl, P_nl_nw, f(k))` at construction, "
+                "via `set_pk_nl`, or as a keyword argument.")
+        if z is None:
+            raise ValueError(
+                "BispectrumCalculator_fk_Geo requires a redshift `z`.")
+        return k_pkl_pklnw_fk_nl, z
+
+    def _geo_factor(self, k1AP, k2AP, k3AP, z):
+        af = interpolate_geo_coeffs(z, self.fi_vals)
+        geo = geo_fac_pade if self.geo_expansion == 'pade' else geo_fac
+        return geo(k1AP, k2AP, k3AP, af, hh=1.0)
+
+    # ----------------------------------------------------------------------
+    #  bispectrum
+    # ----------------------------------------------------------------------
+    def bispectrum(self, k1, k2, x12, mu1, phi, f, sigma2v, Sigma2, deltaSigma2,
+                   bpars, qpar, qperp, k_pkl_pklnw_fk, damping='lor',
+                   interpolation_method='cubic',
+                   k_pkl_pklnw_fk_nl=None, z=None):
+        k_pkl_pklnw_fk_nl, z = self._resolve_nl_state(k_pkl_pklnw_fk_nl, z)
+
+        b1, b2, bs, c1, c2, Bshot, Pshot, X_FoG_b = bpars
+
+        cosphi = np.cos(phi)
+        APtransf = self.APtransforms(k1, k2, x12, mu1, cosphi, qpar, qperp)
+        (k1AP, k2AP, k3AP, x12AP, x23AP, x31AP,
+         mu1AP, mu2AP, mu3AP, cosphi) = APtransf
+
+        eff_fact = self._geo_factor(k1AP, k2AP, k3AP, z)
+
+        src = k_pkl_pklnw_fk_nl
+        k_     = src[0]
+        pkl_   = src[1]
+        pklnw_ = src[2]
+        fk_    = src[3]
+
+        if len(src) >= 5:
+            calAarr  = src[4]
+            calAparr = src[5]
+            if np.ndim(calAarr) > 0 and np.ndim(calAparr) > 0:
+                calA = calAarr[0]; calAp = calAparr[0]
+            else:
+                calA = calAarr; calAp = calAparr
+        else:
+            calA = 1; calAp = 0
+
+        pk1   = self.interpolation_b(k1AP, k_, pkl_,   method=interpolation_method)
+        pk1nw = self.interpolation_b(k1AP, k_, pklnw_, method=interpolation_method)
+        pk2   = self.interpolation_b(k2AP, k_, pkl_,   method=interpolation_method)
+        pk2nw = self.interpolation_b(k2AP, k_, pklnw_, method=interpolation_method)
+        pk3   = self.interpolation_b(k3AP, k_, pkl_,   method=interpolation_method)
+        pk3nw = self.interpolation_b(k3AP, k_, pklnw_, method=interpolation_method)
+
+        f1 = self.interpolation_b(k1AP, k_, fk_, method=interpolation_method)
+        f2 = self.interpolation_b(k2AP, k_, fk_, method=interpolation_method)
+        f3 = self.interpolation_b(k3AP, k_, fk_, method=interpolation_method)
+
+        e1IR = (1 + f1*mu1AP**2*(2 + f1))*Sigma2 + (f1*mu1AP)**2*(mu1AP**2 - 1)*deltaSigma2
+        e2IR = (1 + f2*mu2AP**2*(2 + f2))*Sigma2 + (f2*mu2AP)**2*(mu2AP**2 - 1)*deltaSigma2
+        e3IR = (1 + f3*mu3AP**2*(2 + f3))*Sigma2 + (f3*mu3AP)**2*(mu3AP**2 - 1)*deltaSigma2
+
+        pkIR1 = pk1nw + (pk1-pk1nw)*np.exp(-e1IR*k1AP**2)
+        pkIR2 = pk2nw + (pk2-pk2nw)*np.exp(-e2IR*k2AP**2)
+        pkIR3 = pk3nw + (pk3-pk3nw)*np.exp(-e3IR*k3AP**2)
+
+        Z1_1 = b1 + f1 * mu1AP**2
+        Z1_2 = b1 + f2 * mu2AP**2
+        Z1_3 = b1 + f3 * mu3AP**2
+
+        Z1eft1 = Z1_1 - (c1 * mu1AP**2 + c2 * mu1AP**4) * k1AP**2
+        Z1eft2 = Z1_2 - (c1 * mu2AP**2 + c2 * mu2AP**4) * k2AP**2
+        Z1eft3 = Z1_3 - (c1 * mu3AP**2 + c2 * mu3AP**4) * k3AP**2
+
+        B12 = (2 * eff_fact * self.Z2(k1AP, k2AP, x12AP, mu1AP, mu2AP, f, f1, f2,
+                                       b1, b2, bs, calA, calAp)
+               * Z1eft1 * pkIR1 * Z1eft2 * pkIR2)
+        B23 = (2 * eff_fact * self.Z2(k2AP, k3AP, x23AP, mu2AP, mu3AP, f, f2, f3,
+                                       b1, b2, bs, calA, calAp)
+               * Z1eft2 * pkIR2 * Z1eft3 * pkIR3)
+        B31 = (2 * eff_fact * self.Z2(k3AP, k1AP, x31AP, mu3AP, mu1AP, f, f3, f1,
+                                       b1, b2, bs, calA, calAp)
+               * Z1eft3 * pkIR3 * Z1eft1 * pkIR1)
+
+        W = fog_damping((k1AP * mu1AP, X_FoG_b),
+                        (k2AP * mu2AP, X_FoG_b),
+                        (k3AP * mu3AP, X_FoG_b),
+                        f=f, sigma2v=sigma2v, damping=damping)
+
+        shot = ((b1*Bshot + 2.0*Pshot*f1*mu1AP**2) * Z1eft1 * pkIR1
+                + (b1*Bshot + 2.0*Pshot*f2*mu2AP**2) * Z1eft2 * pkIR2
+                + (b1*Bshot + 2.0*Pshot*f3*mu3AP**2) * Z1eft3 * pkIR3
+                + Pshot**2)
+
+        bispectrum = W*(B12 + B23 + B31) + shot
+        alpha = qpar * qperp**2
+        return bispectrum / alpha**2
+
+    # ----------------------------------------------------------------------
+    #  Sugiyama
+    # ----------------------------------------------------------------------
+    def Sugiyama_Bl1l2L(self, k1, k2, f, sigma2v, Sigma2, deltaSigma2, bpars,
+                        qpar, qper, tablesGL, k_pkl_pklnw_fk, damping='lor',
+                        renormalize=True, multipoles=['B000', 'B202'],
+                        interpolation_method='linear', precision=None,
+                        k_pkl_pklnw_fk_nl=None, z=None):
+        k_pkl_pklnw_fk_nl, z = self._resolve_nl_state(k_pkl_pklnw_fk_nl, z)
+
+        phiGL, xGL, muGL = tablesGL
+        phi, wphi = phiGL[:, 0], phiGL[:, 1]
+        x, wx     = xGL[:, 0],  xGL[:, 1]
+        mu, wmu   = muGL[:, 0], muGL[:, 1]
+
+        x_mesh   = x[None, :, None, None]
+        mu_mesh  = mu[None, None, :, None]
+        phi_mesh = phi[None, None, None, :]
+        cosphi   = np.cos(phi_mesh)
+        cos2phi  = np.cos(2 * phi_mesh)
+
+        bisp = self.bispectrum(
+            k1, k2, x_mesh, mu_mesh, phi_mesh,
+            f, sigma2v, Sigma2, deltaSigma2,
+            bpars, qpar, qper, k_pkl_pklnw_fk,
+            damping=damping, interpolation_method=interpolation_method,
+            k_pkl_pklnw_fk_nl=k_pkl_pklnw_fk_nl, z=z)
+
+        Hl1l2L_dict = {
+            'B000': 1.0, 'B110': -1 / np.sqrt(3), 'B220': 1 / np.sqrt(5),
+            'B202': 1 / np.sqrt(5), 'B022': 1 / np.sqrt(5),
+            'B112': np.sqrt(2 / 15), 'B222': -2 / np.sqrt(70),
+        }
+
+        result = {}
+        for mp in multipoles:
+            integrand = self._compute_single_integrand(mp, x_mesh, mu_mesh,
+                                                        phi_mesh, cosphi, cos2phi)
+            int_phi = 2 * np.sum(bisp * integrand * wphi[None, None, None, :], axis=3)
+            int_mu  = np.sum(int_phi * wmu[None, None, :], axis=2)
+            int_x   = np.sum(int_mu * wx[None, :], axis=1)
+            if renormalize:
+                int_x *= Hl1l2L_dict[mp]
+            if np.ndim(k1) == 0 and np.ndim(k2) == 0:
+                result[mp] = float(int_x)
+            else:
+                result[mp] = int_x
+        return result
+
+    def Sugiyama_Bell(self, f, bpars, k_pkl_pklnw_fk, k1k2pairs, qpar, qper,
+                      precision=[8, 10, 10], damping='lor',
+                      m_bin=None, k_thy=None, do_binning=False,
+                      multipoles=['B000', 'B202'], renormalize=True,
+                      interpolation_method='linear', bias_scheme='folps',
+                      do_interp_bk=False, kout=None,
+                      k_pkl_pklnw_fk_nl=None, z=None):
+        all_multipoles = ['B000', 'B110', 'B220', 'B202', 'B022', 'B112', 'B222']
+        for mp in multipoles:
+            if mp not in all_multipoles:
+                raise ValueError(f"Invalid multipole '{mp}'. Available: {all_multipoles}")
+
+        k_pkl_pklnw_fk_nl, z = self._resolve_nl_state(k_pkl_pklnw_fk_nl, z)
+
+        bpars = self.set_bias_scheme(bpars, bias_scheme=bias_scheme)
+
+        k1k2pairs = np.asarray(k1k2pairs)
+        k1 = k1k2pairs[:, 0][:, None, None, None]
+        k2 = k1k2pairs[:, 1][:, None, None, None]
+
+        tablesGL = self.tablesGL_f(precision)
+        sigma2v, Sigma2, deltaSigma2 = self.sigmas(k_pkl_pklnw_fk[0], k_pkl_pklnw_fk[1])
+
+        phiGL, xGL, muGL = tablesGL
+        phi, wphi = phiGL[:, 0], phiGL[:, 1]
+        x, wx     = xGL[:, 0],  xGL[:, 1]
+        mu, wmu   = muGL[:, 0], muGL[:, 1]
+
+        x_mesh   = x[None, :, None, None]
+        mu_mesh  = mu[None, None, :, None]
+        phi_mesh = phi[None, None, None, :]
+        cosphi   = np.cos(phi_mesh)
+        cos2phi  = np.cos(2 * phi_mesh)
+
+        bisp = self.bispectrum(
+            k1, k2, x_mesh, mu_mesh, phi_mesh,
+            f, sigma2v, Sigma2, deltaSigma2,
+            bpars, qpar, qper, k_pkl_pklnw_fk,
+            damping=damping, interpolation_method=interpolation_method,
+            k_pkl_pklnw_fk_nl=k_pkl_pklnw_fk_nl, z=z)
+
+        Hl1l2L_dict = {
+            'B000': 1.0, 'B110': -1 / np.sqrt(3), 'B220': 1 / np.sqrt(5),
+            'B202': 1 / np.sqrt(5), 'B022': 1 / np.sqrt(5),
+            'B112': np.sqrt(2 / 15), 'B222': -2 / np.sqrt(70),
+        }
+
+        multipoles_dict = {}
+        for mp in multipoles:
+            integrand = self._compute_single_integrand(mp, x_mesh, mu_mesh,
+                                                        phi_mesh, cosphi, cos2phi)
+            int_phi = 2 * np.sum(bisp * integrand * wphi[None, None, None, :], axis=3)
+            int_mu  = np.sum(int_phi * wmu[None, None, :], axis=2)
+            int_x   = np.sum(int_mu * wx[None, :], axis=1)
+            if renormalize:
+                int_x *= Hl1l2L_dict[mp]
+            multipoles_dict[mp] = int_x
+
+        if do_binning:
+            if m_bin is None or k_thy is None:
+                raise ValueError("do_binning=True requires m_bin and k_thy.")
+            m_bin_arr = np.asarray(m_bin); k_thy_arr = np.asarray(k_thy)
+            x = np.asarray(k1k2pairs)[:, 0]
+            binned_results = []
+            for mp in multipoles:
+                mp_interp = interp(k_thy_arr, x, multipoles_dict[mp])
+                binned_results.append(m_bin_arr @ mp_interp)
+            return tuple(binned_results)
+
+        if do_interp_bk:
+            if kout is None:
+                raise ValueError("do_interp=True requires kout.")
+            k_thy_arr = np.asarray(kout)
+            x = np.asarray(k1k2pairs)[:, 0]
+            interp_results = []
+            for mp in multipoles:
+                interp_results.append(interp(k_thy_arr, x, multipoles_dict[mp]))
+            return tuple(interp_results)
+
+        return tuple(multipoles_dict[mp] for mp in multipoles)
+
+    # ----------------------------------------------------------------------
+    #  Scoccimarro
+    # ----------------------------------------------------------------------
+    def Scoccimarro_B024(self, k1k2k3triplets, f, sigma2v, Sigma2, deltaSigma2,
+                         bpars, qpar, qperp, tablesGL, k_pkl_pklnw_fk,
+                         damping='lor', interpolation_method='linear',
+                         multipoles=['B0', 'B2', 'B4'],
+                         k_pkl_pklnw_fk_nl=None, z=None):
+        k_pkl_pklnw_fk_nl, z = self._resolve_nl_state(k_pkl_pklnw_fk_nl, z)
+
+        twopi = 2.0 * np.pi
+        normB0, normB2, normB4 = 0.5, 2.5, 4.5
+
+        k1k2k3triplets = np.asarray(k1k2k3triplets)
+        k1 = k1k2k3triplets[:, 0][:, None, None]
+        k2 = k1k2k3triplets[:, 1][:, None, None]
+        k3 = k1k2k3triplets[:, 2][:, None, None]
+        x = (k3**2 - k1**2 - k2**2) / (2.0 * k1 * k2)
+
+        phiGL, muGL = tablesGL
+        phi, wphi = phiGL[:, 0], phiGL[:, 1]
+        mu,  wmu  = muGL[:, 0],  muGL[:, 1]
+
+        mu_mesh  = mu[None, :, None]
+        phi_mesh = phi[None, None, :]
+
+        bisp = self.bispectrum(
+            k1, k2, x, mu_mesh, phi_mesh,
+            f, sigma2v, Sigma2, deltaSigma2,
+            bpars, qpar, qperp, k_pkl_pklnw_fk,
+            damping=damping, interpolation_method=interpolation_method,
+            k_pkl_pklnw_fk_nl=k_pkl_pklnw_fk_nl, z=z)
+
+        int_phi = 2.0 * np.sum(bisp * wphi[None, None, :], axis=2)
+
+        results = {}
+        if 'B0' in multipoles:
+            results['B0'] = (np.sum(int_phi * wmu[None, :], axis=1) / twopi) * normB0
+        else:
+            results['B0'] = None
+
+        if 'B2' in multipoles:
+            leg2 = 0.5 * (-1.0 + 3.0 * mu**2)
+            results['B2'] = (np.sum(int_phi * leg2[None, :] * wmu[None, :], axis=1)
+                             / twopi) * normB2
+        else:
+            results['B2'] = None
+
+        if 'B4' in multipoles:
+            leg4 = (35.0 * mu**4 - 30.0 * mu**2 + 3.0) / 8.0
+            results['B4'] = (np.sum(int_phi * leg4[None, :] * wmu[None, :], axis=1)
+                             / twopi) * normB4
+        else:
+            results['B4'] = None
+
+        return results['B0'], results['B2'], results['B4'], x[:, 0, 0]
+
+    def Scoccimarro_Bell(self, k1k2k3triplets, f, bpars, qpar, qperp,
+                         k_pkl_pklnw_fk, precision=[10, 10], damping='lor',
+                         interpolation_method='linear', m_bin=None, k_thy=None,
+                         do_binning=False, multipoles=['B0', 'B2', 'B4'],
+                         bias_scheme='folps',
+                         k_pkl_pklnw_fk_nl=None, z=None):
+        k_pkl_pklnw_fk_nl, z = self._resolve_nl_state(k_pkl_pklnw_fk_nl, z)
+
+        bpars = self.set_bias_scheme(bpars, bias_scheme=bias_scheme)
+
+        kT, pklT = k_pkl_pklnw_fk[0], k_pkl_pklnw_fk[1]
+        sigma2v, Sigma2, deltaSigma2 = self.sigmas(kT, pklT)
+
+        tablesGL = self.tablesGL2_f(precision)
+
+        if backend == 'jax':
+            try:
+                import jax
+
+                def _single(k1, k2, k3):
+                    triplet = np.array([[k1, k2, k3]])
+                    return self.Scoccimarro_B024(
+                        triplet, f, sigma2v, Sigma2, deltaSigma2, bpars,
+                        qpar, qperp, tablesGL, k_pkl_pklnw_fk, damping=damping,
+                        interpolation_method=interpolation_method,
+                        multipoles=multipoles,
+                        k_pkl_pklnw_fk_nl=k_pkl_pklnw_fk_nl, z=z)
+
+                vm = jax.vmap(_single)
+                triplets_arr = np.asarray(k1k2k3triplets)
+                stacked = vm(triplets_arr[:, 0], triplets_arr[:, 1], triplets_arr[:, 2])
+                B0 = stacked[0][:, 0]; B2 = stacked[1][:, 0]
+                B4 = stacked[2][:, 0]; x  = stacked[3][:, 0]
+
+                if do_binning:
+                    if m_bin is None or k_thy is None:
+                        raise ValueError("do_binning=True requires m_bin and k_thy.")
+                    m_bin_arr = np.asarray(m_bin); k_thy_arr = np.asarray(k_thy)
+                    k_vals = triplets_arr[:, 0]
+                    return (m_bin_arr @ interp(k_thy_arr, k_vals, B0),
+                            m_bin_arr @ interp(k_thy_arr, k_vals, B2),
+                            m_bin_arr @ interp(k_thy_arr, k_vals, B4))
+                return B0, B2, B4, x
+            except Exception:
+                pass
+
+        B0, B2, B4, x = self.Scoccimarro_B024(
+            k1k2k3triplets, f, sigma2v, Sigma2, deltaSigma2, bpars,
+            qpar, qperp, tablesGL, k_pkl_pklnw_fk, damping, interpolation_method,
+            multipoles=multipoles,
+            k_pkl_pklnw_fk_nl=k_pkl_pklnw_fk_nl, z=z)
+
+        if do_binning:
+            if m_bin is None or k_thy is None:
+                raise ValueError("do_binning=True requires m_bin and k_thy.")
+            m_bin_arr = np.asarray(m_bin); k_thy_arr = np.asarray(k_thy)
+            triplets_arr = np.asarray(k1k2k3triplets)
+            k_vals = triplets_arr[:, 0]
+            return (m_bin_arr @ interp(k_thy_arr, k_vals, B0),
+                    m_bin_arr @ interp(k_thy_arr, k_vals, B2),
+                    m_bin_arr @ interp(k_thy_arr, k_vals, B4))
+
+        return B0, B2, B4, x
 
 
 ########################################################
